@@ -1,2 +1,3 @@
 # cmake-spm
-Import of SwiftPM targets into CMake projects
+
+A description of this package.
