@@ -59,23 +59,34 @@ fileprivate extension Target.ProductReference {
   }
 }
 
+fileprivate func generateModuleName(targetName: String,
+                                    moduleName: String,
+                                    out: inout TemplatePrinter) {
+  let fixedModuleName = moduleName.replacingOccurrences(of: "-", with: "_")
+
+  out <| "set_target_properties(\(targetName) PROPERTIES"
+  out <| { out in
+    out <| "Swift_MODULE_NAME \(fixedModuleName)"
+  }
+  out <| ")"
+}
+
 fileprivate extension ResolvedTarget {
   func generate(_ ctx: GenContext, pkg: PackageIdentity, out: inout TemplatePrinter) {
     let name = self.underlyingTarget.gen_name(pkg)
 
     out <| "add_library(\(name) STATIC"
     out <| { out in
-      underlyingTarget.sources.paths.forEach{
-        out <| "${CMAKE_CURRENT_LIST_DIR}/\($0.relative(to: ctx.rootPath).pathString.replacingOccurrences(of: " ", with: "\\ "))"
+      underlyingTarget.sources.paths.forEach {
+        let srcPath = $0.relative(to: ctx.rootPath).pathString
+          .replacingOccurrences(of: " ", with: "\\ ")
+          .replacingOccurrences(of: ">", with: "_")
+        out <| "${CMAKE_CURRENT_LIST_DIR}/\(srcPath)"
       }
     }
     out <| ")"
 
-    out <| "set_target_properties(\(name) PROPERTIES"
-    out <| { out in
-      out <| "Swift_MODULE_NAME \(self.name)"
-    }
-    out <| ")"
+    generateModuleName(targetName: name, moduleName: self.name, out: &out)
 
     if !underlyingTarget.dependencies.isEmpty {
       out <| "target_link_libraries(\(name) PRIVATE"
@@ -110,11 +121,16 @@ fileprivate extension ResolvedProduct {
 
     switch(self.type) {
     case .library(.dynamic):
-      out <| "add_library(\(name) SHARED"
+      out <| "add_library(\(name) SHARED empty.swift"
       out <| {
         generate_targets(&$0, pkg: pkg, use_objs: true)
       }
       out <| ")"
+
+      out <| ("target_include_directories(\(name) PUBLIC ${CMAKE_CURRENT_BINARY_DIR})")
+
+      generateModuleName(targetName: name, moduleName: name + "_product", out: &out)
+
     case .library(_):
       out <| "add_library(\(name) INTERFACE)"
       out <| "target_link_libraries(\(name) INTERFACE"
@@ -122,6 +138,8 @@ fileprivate extension ResolvedProduct {
         generate_targets(&$0, pkg: pkg)
       }
       out <| ")"
+
+      out <| ("target_include_directories(\(name) INTERFACE ${CMAKE_CURRENT_BINARY_DIR})")
     case .executable:
       out <| ("add_executable(\(name)")
       out <| {
@@ -129,6 +147,7 @@ fileprivate extension ResolvedProduct {
       }
       out <| ")"
 
+      out <| ("target_include_directories(\(name) PUBLIC ${CMAKE_CURRENT_BINARY_DIR})")
     default:
       break
     }

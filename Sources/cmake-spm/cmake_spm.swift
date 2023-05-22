@@ -35,7 +35,7 @@ struct Generate: ParsableCommand {
       }
     })
 
-    let deps: [PackageDependency] = urls.compactMap(get_dependency)
+    let deps: [PackageDependency] = try urls.compactMap(get_dependency)
     let input = PackageGraphRootInput(packages: [], dependencies: deps)
 
     try workspace.resolve(root: input, observabilityScope: observability.topScope)
@@ -43,6 +43,7 @@ struct Generate: ParsableCommand {
     let graph = try workspace.loadPackageGraph(rootInput: input, observabilityScope: observability.topScope)
 
     let cmakeGen = CMakeGen(graph: graph, cmakeListsDir: self.output)
+
     try cmakeGen.generate()
   }
 }
@@ -55,27 +56,43 @@ func get_abs_path(_ path: String) throws -> AbsolutePath {
   return path
 }
 
-func get_dependency(_ url: String) -> PackageDependency? {
-  let regex = #/(?<url>[^\#]+)\#(branch=(?<branch>.+)|commit=(?<commit>.+)|version=(?<version>.+))/#
+func get_dependency(_ url: String) throws -> PackageDependency? {
+  let regex = #/(?<url>[^\#]+)(\#(branch=(?<branch>.+)|commit=(?<commit>.+)|version=(?<version>.+)))?/#
 
   guard let match = url.wholeMatch(of: regex),
-        let url = URL(string: String(match.output.url)) else { return nil }
-
-  let req: PackageDependency.SourceControl.Requirement
-  if let value = match.output.branch {
-    req = PackageDependency.SourceControl.Requirement.branch(String(value))
-  } else if let value = match.output.version {
-    req = PackageDependency.SourceControl.Requirement.exact(Version(stringLiteral: String(value)))
-  } else if let value = match.output.commit {
-    req = PackageDependency.SourceControl.Requirement.revision(String(value))
-  } else {
+        let url = URL(string: String(match.output.url)) else {
     return nil
   }
 
-  return PackageDependency.sourceControl(
-    identity: PackageIdentity(url: url),
-    nameForTargetDependencyResolutionOnly: nil,
-    location: .remote(url),
-    requirement: req,
-    productFilter: .everything)
+  if match.output.branch == nil && match.output.version == nil && match.output.commit == nil {
+    // local file
+    if url.scheme != nil && url.scheme != "file" {
+      throw "Invalid remote URL without branch/version/revision specification: \(url)"
+    }
+
+    return PackageDependency.fileSystem(
+      identity: PackageIdentity(url: url),
+      nameForTargetDependencyResolutionOnly: nil,
+      path: AbsolutePath(url.path),
+      productFilter: .everything
+    )
+  } else {
+    let req: PackageDependency.SourceControl.Requirement
+    if let value = match.output.branch {
+      req = PackageDependency.SourceControl.Requirement.branch(String(value))
+    } else if let value = match.output.version {
+      req = PackageDependency.SourceControl.Requirement.exact(Version(stringLiteral: String(value)))
+    } else if let value = match.output.commit {
+      req = PackageDependency.SourceControl.Requirement.revision(String(value))
+    } else {
+      throw "Unknown dependency requirement"
+    }
+
+    return PackageDependency.sourceControl(
+      identity: PackageIdentity(url: url),
+      nameForTargetDependencyResolutionOnly: nil,
+      location: .remote(url),
+      requirement: req,
+      productFilter: .everything)
+    }
 }
