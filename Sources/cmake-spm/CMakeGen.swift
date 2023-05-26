@@ -11,15 +11,19 @@ import PackageModel
 
 protocol GenContext {
   var rootPath: AbsolutePath { get }
+  func nameWithScope(_ name: String) -> String;
+  func getScopeName() -> String?;
 }
 
 class CMakeGen: GenContext {
   let graph: PackageGraph
   let rootPath: AbsolutePath
+  let scopeName: String?
 
-  init(graph: PackageGraph, cmakeListsDir: AbsolutePath) {
+  init(graph: PackageGraph, cmakeListsDir: AbsolutePath, scopeName: String?) {
     self.graph = graph
     self.rootPath = cmakeListsDir
+    self.scopeName = scopeName
   }
 
   func generate() throws {
@@ -31,6 +35,20 @@ class CMakeGen: GenContext {
 
     let outputFile = rootPath.appending(RelativePath("CMakeLists.txt"))
     try localFileSystem.writeFileContents(outputFile, string: out.content)
+  }
+
+  // Returns name with scope for specified name
+  public func nameWithScope(_ name: String) -> String {
+    if let scName = scopeName {
+      return scName + "-" + name
+    } else {
+      return name
+    }
+  }
+
+  // Returns scope name
+  public func getScopeName() -> String? {
+    return self.scopeName
   }
 }
 
@@ -71,11 +89,27 @@ fileprivate func generateModuleName(targetName: String,
   out <| ")"
 }
 
+fileprivate func generateLibraryAlias(ctx: GenContext,
+                                      targetName: String,
+                                      out: inout TemplatePrinter) {
+  guard let scopeName = ctx.getScopeName() else { return }
+
+  let nameWithScope = ctx.nameWithScope(targetName) 
+  out <| "add_library(\(scopeName)::\(targetName) ALIAS \(nameWithScope))"
+}
+
 fileprivate extension ResolvedTarget {
   func generate(_ ctx: GenContext, pkg: PackageIdentity, out: inout TemplatePrinter) {
-    let name = self.underlyingTarget.gen_name(pkg)
+    let nameWithScope = ctx.nameWithScope(self.underlyingTarget.gen_name(pkg))
 
-    out <| "add_library(\(name) STATIC"
+    out <| "add_library(\(nameWithScope) STATIC"
+
+    if underlyingTarget.sources.paths.isEmpty {
+      // add empty swift source for targets without source files. This
+      // is required for correct detection of language in cmake
+      out <| "empty.swift"
+    }
+
     out <| { out in
       underlyingTarget.sources.paths.forEach {
         let srcPath = $0.relative(to: ctx.rootPath).pathString
@@ -86,17 +120,19 @@ fileprivate extension ResolvedTarget {
     }
     out <| ")"
 
-    generateModuleName(targetName: name, moduleName: self.name, out: &out)
+    out <| ("target_include_directories(\(nameWithScope) PUBLIC ${CMAKE_CURRENT_BINARY_DIR})")
+
+    generateModuleName(targetName: nameWithScope, moduleName: self.name, out: &out)
 
     if !underlyingTarget.dependencies.isEmpty {
-      out <| "target_link_libraries(\(name) PRIVATE"
+      out <| "target_link_libraries(\(nameWithScope) PRIVATE"
       out <| { out in
         underlyingTarget.dependencies.forEach{
           switch $0 {
           case .target(let t, _):
-            out <| "\(t.gen_name(pkg))"
+            out <| "\(ctx.nameWithScope(t.gen_name(pkg)))"
           case .product(let p, _):
-            out <| p.gen_name(pkg)
+            out <| ctx.nameWithScope(p.gen_name(pkg))
           }
         }
       }
@@ -117,46 +153,53 @@ fileprivate extension Product {
 
 fileprivate extension ResolvedProduct {
   func generate(_ ctx: GenContext, pkg: PackageIdentity, out: inout TemplatePrinter) {
-    let name = self.underlyingProduct.gen_name(pkg)
+    let targetName = self.underlyingProduct.gen_name(pkg)
+    let nameWithScope = ctx.nameWithScope(targetName)
 
     switch(self.type) {
     case .library(.dynamic):
-      out <| "add_library(\(name) SHARED empty.swift"
+      out <| "add_library(\(nameWithScope) SHARED empty.swift"
       out <| {
-        generate_targets(&$0, pkg: pkg, use_objs: true)
+        generate_targets(ctx: ctx, &$0, pkg: pkg, use_objs: true)
       }
       out <| ")"
 
-      out <| ("target_include_directories(\(name) PUBLIC ${CMAKE_CURRENT_BINARY_DIR})")
+      out <| ("target_include_directories(\(nameWithScope) PUBLIC ${CMAKE_CURRENT_BINARY_DIR})")
 
-      generateModuleName(targetName: name, moduleName: name + "_product", out: &out)
+      generateModuleName(targetName: nameWithScope, moduleName: nameWithScope + "_product", out: &out)
+      generateLibraryAlias(ctx: ctx, targetName: targetName, out: &out)
 
     case .library(_):
-      out <| "add_library(\(name) INTERFACE)"
-      out <| "target_link_libraries(\(name) INTERFACE"
+      out <| "add_library(\(nameWithScope) INTERFACE)"
+      out <| "target_link_libraries(\(nameWithScope) INTERFACE"
       out <| {
-        generate_targets(&$0, pkg: pkg)
+        generate_targets(ctx: ctx, &$0, pkg: pkg)
       }
       out <| ")"
 
-      out <| ("target_include_directories(\(name) INTERFACE ${CMAKE_CURRENT_BINARY_DIR})")
+      out <| ("target_include_directories(\(nameWithScope) INTERFACE ${CMAKE_CURRENT_BINARY_DIR})")
+      generateLibraryAlias(ctx: ctx, targetName: targetName, out: &out)
+
     case .executable:
-      out <| ("add_executable(\(name)")
+      out <| ("add_executable(\(nameWithScope) empty.swift")
       out <| {
-        generate_targets(&$0, pkg: pkg)
+        generate_targets(ctx: ctx, &$0, pkg: pkg, use_objs: true)
       }
       out <| ")"
 
-      out <| ("target_include_directories(\(name) PUBLIC ${CMAKE_CURRENT_BINARY_DIR})")
+      out <| ("target_include_directories(\(nameWithScope) PUBLIC ${CMAKE_CURRENT_BINARY_DIR})")
     default:
       break
     }
   }
 
-  private func generate_targets(_ out: inout TemplatePrinter, pkg: PackageIdentity, use_objs: Bool = false) {
+  private func generate_targets(ctx: GenContext,
+                                _ out: inout TemplatePrinter,
+                                pkg: PackageIdentity,
+                                use_objs: Bool = false) {
     self.underlyingProduct.targets.forEach{
-      let name = $0.gen_name(pkg)
-      out <| (use_objs ? "$<TARGET_OBJECTS:\(name)>" : name)
+      let nameWithScope = ctx.nameWithScope($0.gen_name(pkg))
+      out <| (use_objs ? "$<TARGET_OBJECTS:\(nameWithScope)>" : nameWithScope)
     }
   }
 }

@@ -18,6 +18,9 @@ struct Generate: ParsableCommand {
   @Option(name: .customLong("workspace"), help: "Workspace path", transform: get_abs_path)
   var workspacePath: AbsolutePath = localFileSystem.currentWorkingDirectory!
 
+  @Option(name: .customLong("scope"), help: "Scope name for workspace")
+  var scopeName: String?
+
   @Argument(help: "Swift packages URLs")
   var urls: [String]
 
@@ -42,7 +45,7 @@ struct Generate: ParsableCommand {
 
     let graph = try workspace.loadPackageGraph(rootInput: input, observabilityScope: observability.topScope)
 
-    let cmakeGen = CMakeGen(graph: graph, cmakeListsDir: self.output)
+    let cmakeGen = CMakeGen(graph: graph, cmakeListsDir: self.output, scopeName: self.scopeName)
 
     try cmakeGen.generate()
   }
