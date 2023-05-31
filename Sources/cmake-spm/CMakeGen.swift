@@ -98,11 +98,36 @@ fileprivate func generateLibraryAlias(ctx: GenContext,
   out <| "add_library(\(scopeName)::\(targetName) ALIAS \(nameWithScope))"
 }
 
+fileprivate func generateSystemLibraryTarget(ctx: GenContext,
+                                             pkg: PackageIdentity,
+                                             target: ResolvedTarget,
+                                             out: inout TemplatePrinter) {
+  // source directory for a system library target contains modulemap file
+
+  let targetName = target.underlyingTarget.gen_name(pkg)
+  let nameWithScope = ctx.nameWithScope(target.underlyingTarget.gen_name(pkg))
+  
+  out <| "add_library(\(nameWithScope) INTERFACE)"
+  out <| "target_include_directories(\(nameWithScope) INTERFACE \(target.underlyingTarget.path))"
+
+  generateLibraryAlias(ctx: ctx, targetName: targetName, out: &out)
+}
+
 fileprivate extension ResolvedTarget {
   func generate(_ ctx: GenContext, pkg: PackageIdentity, out: inout TemplatePrinter) {
     let nameWithScope = ctx.nameWithScope(self.underlyingTarget.gen_name(pkg))
 
-    out <| "add_library(\(nameWithScope) STATIC"
+    // special case for system libraries
+    if self.type == .systemModule {
+      generateSystemLibraryTarget(ctx: ctx, pkg: pkg, target: self, out: &out)
+      return
+    }
+
+    if self.type == .executable {
+      out <| "add_executable(\(nameWithScope)"
+    } else {
+      out <| "add_library(\(nameWithScope) STATIC"
+    }
 
     if underlyingTarget.sources.paths.isEmpty {
       // add empty swift source for targets without source files. This
@@ -124,13 +149,88 @@ fileprivate extension ResolvedTarget {
 
     generateModuleName(targetName: nameWithScope, moduleName: self.name, out: &out)
 
+    // define SWIFT_PACKAGE macro for building all targets
+    if underlyingTarget is ClangTarget {
+      out <| "target_compile_definitions(\(nameWithScope) PRIVATE SWIFT_PACKAGE=1)"
+    } else {
+      out <| "target_compile_definitions(\(nameWithScope) PRIVATE SWIFT_PACKAGE)"
+    }
+
+    if let clangTarget = underlyingTarget as? ClangTarget {
+      out <| "target_include_directories(\(nameWithScope) PUBLIC \(clangTarget.includeDir))"
+
+      if clangTarget.isCXX, let cxxStandard = clangTarget.cxxLanguageStandard {
+        let cmakeCxxStandard = cxxStandard.dropFirst(3)
+        out <| "set_target_properties(\(nameWithScope) PROPERTIES CXX_STANDARD \(cmakeCxxStandard))"
+      }
+    } else {
+      // For swift targets which depend on C/C++ targets, we have to add include directories
+      // from C/C++ targets into C compile flags
+      let includeDirs = getClangIncludeDirectories(target: self)
+      if !includeDirs.isEmpty {
+        out <| "target_compile_options(\(nameWithScope) PRIVATE"
+        out <| { out in
+          for includeDir in includeDirs {
+            out <| "\"SHELL:-Xcc -I -Xcc \(includeDir.pathString)\""
+          }
+        }
+        out <| ")"
+      }
+    }
+
+    // adding path to system frameworks
+    out <| "target_compile_options(\(nameWithScope) PRIVATE -F${CMAKE_OSX_SYSROOT}/../../Library/Frameworks)"
+    out <| "target_include_directories(\(nameWithScope) PRIVATE ${CMAKE_OSX_SYSROOT}/../../usr/lib)"
+
+    // generating flags
+    for (declaration, assignments) in underlyingTarget.buildSettings.assignments {
+      if (declaration == .SWIFT_ACTIVE_COMPILATION_CONDITIONS) {
+        for assignment in assignments {
+          // TODO: implement conditions
+          out <| "target_compile_definitions(\(nameWithScope) PRIVATE"
+          out <| { out in
+            for value in assignment.values {
+              out <| value
+            }
+          }
+          out <| ")"
+        }
+      } else if declaration == .LINK_LIBRARIES {
+        for assignment in assignments {
+          // TODO: implement conditions
+          out <| "target_link_libraries(\(nameWithScope) PUBLIC"
+          out <| { out in
+            for value in assignment.values {
+              out <| value
+            }
+          }
+          out <| ")"
+        }
+      } else if declaration == .OTHER_SWIFT_FLAGS {
+        for assignment in assignments {
+          // TODO: implement conditions
+          out <| "target_compile_options(\(nameWithScope) PRIVATE"
+          out <| { out in
+            for value in assignment.values {
+              out <| value
+            }
+          }
+          out <| ")"
+        }
+      }
+    }
+
     if !underlyingTarget.dependencies.isEmpty {
-      out <| "target_link_libraries(\(nameWithScope) PRIVATE"
+      out <| "target_link_libraries(\(nameWithScope) PUBLIC "
       out <| { out in
         underlyingTarget.dependencies.forEach{
           switch $0 {
           case .target(let t, _):
-            out <| "\(ctx.nameWithScope(t.gen_name(pkg)))"
+            if (t.type == .executable) {
+              out <| "$<TARGET_OBJECTS:\(ctx.nameWithScope(t.gen_name(pkg)))>"
+            } else {
+              out <| "\(ctx.nameWithScope(t.gen_name(pkg)))"
+            }
           case .product(let p, _):
             out <| ctx.nameWithScope(p.gen_name(pkg))
           }
@@ -138,6 +238,30 @@ fileprivate extension ResolvedTarget {
       }
       out <| ")"
     }
+
+    
+  }
+
+  // Recursively iterates all target dependnecies and returns array of include directories
+  // for C and C++ targets
+  func getClangIncludeDirectories(target: ResolvedTarget) -> [AbsolutePath] {
+    var res: [AbsolutePath] = []
+    if let clangTarget = target.underlyingTarget as? ClangTarget {
+      res.append(clangTarget.includeDir)
+    }
+
+    for dependency in target.dependencies {
+      switch dependency {
+      case .target(let depTarget, _):
+        res += getClangIncludeDirectories(target: depTarget)
+      case .product(let depProduct, _):
+        for depProductTarget in depProduct.targets {
+          res += getClangIncludeDirectories(target: depProductTarget)
+        }
+      }
+    }
+
+    return Set(res).sorted()
   }
 }
 
@@ -197,9 +321,13 @@ fileprivate extension ResolvedProduct {
                                 _ out: inout TemplatePrinter,
                                 pkg: PackageIdentity,
                                 use_objs: Bool = false) {
-    self.underlyingProduct.targets.forEach{
-      let nameWithScope = ctx.nameWithScope($0.gen_name(pkg))
-      out <| (use_objs ? "$<TARGET_OBJECTS:\(nameWithScope)>" : nameWithScope)
+    self.targets.forEach { depTarget in
+      let nameWithScope = ctx.nameWithScope(depTarget.underlyingTarget.gen_name(pkg))
+      if (use_objs || depTarget.type == .executable) {
+        out <| "$<TARGET_OBJECTS:\(nameWithScope)>"
+      } else {
+        out <| nameWithScope
+      }
     }
   }
 }
